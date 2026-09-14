@@ -1,30 +1,28 @@
+import json
 import os
 import uuid
-from datetime import datetime, timezone
 from typing import Optional
 
-import asyncpg
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
+import redis.asyncio as redis
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres_password@localhost:5432/emergency_db")
-DEFAULT_ORG_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+STREAM_NAME = "incidents:ingest"
 
 app = FastAPI(title="Resilient Response API")
 
 
-# Database Pool Management
 @app.on_event("startup")
 async def startup():
-    app.state.db_pool = await asyncpg.create_pool(dsn=DATABASE_URL)
+    app.state.redis = redis.from_url(REDIS_URL, decode_responses=True)
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    await app.state.db_pool.close()
+    await app.state.redis.close()
 
 
-# Pydantic Input Model
 class IncidentIngestionRequest(BaseModel):
     submission_id: str = Field(..., example="SUB-001")
     channel: str = Field(..., example="USSD")
@@ -34,7 +32,6 @@ class IncidentIngestionRequest(BaseModel):
     description: Optional[str] = Field(None, example="Incident reported near Central Market")
 
 
-# Response Model
 class IncidentIngestionResponse(BaseModel):
     status: str
     submission_id: str
@@ -48,40 +45,28 @@ class IncidentIngestionResponse(BaseModel):
 )
 async def ingest_incident(payload: IncidentIngestionRequest):
     incident_id = f"IR-{payload.submission_id.upper()}"
-    now = datetime.now(timezone.utc)
+    organization_id = "00000000-0000-0000-0000-000000000001"
 
-    async with app.state.db_pool.acquire() as conn:
-        try:
-            # Insert incident directly into PostgreSQL
-            await conn.execute(
-                """
-                INSERT INTO incidents (
-                    incident_id, organization_id, submission_id, channel, 
-                    category, urgency, status, location_text, description, received_at
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, 'QUEUED', $7, $8, $9)
-                """,
-                incident_id,
-                DEFAULT_ORG_ID,
-                payload.submission_id,
-                payload.channel,
-                payload.category,
-                payload.urgency,
-                payload.location_text,
-                payload.description,
-                now,
-            )
+    # Serialize payload for stream message
+    event_data = {
+        "incident_id": incident_id,
+        "organization_id": organization_id,
+        "submission_id": payload.submission_id,
+        "channel": payload.channel,
+        "category": payload.category,
+        "urgency": payload.urgency,
+        "location_text": payload.location_text,
+        "description": payload.description or "",
+    }
 
-            return IncidentIngestionResponse(
-                status="ACCEPTED",
-                submission_id=payload.submission_id,
-                incident_id=incident_id,
-            )
+    # Push to Redis Stream using XADD
+    await app.state.redis.xadd(
+        STREAM_NAME,
+        {"payload": json.dumps(event_data)}
+    )
 
-        except asyncpg.UniqueViolationError:
-            # Handle duplicate submission cleanly without creating a second record
-            return IncidentIngestionResponse(
-                status="ALREADY_ACCEPTED",
-                submission_id=payload.submission_id,
-                incident_id=incident_id,
-            )
+    return IncidentIngestionResponse(
+        status="ACCEPTED",
+        submission_id=payload.submission_id,
+        incident_id=incident_id,
+    )
