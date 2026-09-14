@@ -1,0 +1,19 @@
+# Python temporary files & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+ENV/
+
+# Environment files with passwords/secrets
+.env
+
+# Database data folders (local development)
+.postgres_data/
+.redis_data/
+
+# OS junk files
+.DS_Store
+Thumbs.db
