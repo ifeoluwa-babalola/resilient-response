@@ -70,3 +70,37 @@ async def ingest_incident(payload: IncidentIngestionRequest):
         submission_id=payload.submission_id,
         incident_id=incident_id,
     )
+
+# Minimal ACK request model
+class IncidentAckRequest(BaseModel):
+    responder_id: str
+
+
+@app.post("/v1/incidents/{incident_id}/ack", status_code=status.HTTP_200_OK)
+async def acknowledge_incident(incident_id: str, payload: IncidentAckRequest):
+    """Simulates a responder clicking ACK on their dashboard."""
+    now = datetime.now(timezone.utc)
+    
+    async with app.state.db_pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE assignments 
+            SET status = 'ACKNOWLEDGED', ack_at = $1 
+            WHERE incident_id = $2 AND responder_id = $3 AND status = 'ASSIGNED';
+            """,
+            now, incident_id, payload.responder_id
+        )
+
+        if result == "UPDATE 0":
+            raise HTTPException(status_code=400, detail="Assignment not found, already acknowledged, or timed out.")
+
+        await conn.execute(
+            """
+            UPDATE incidents 
+            SET status = 'IN_PROGRESS', ack_deadline = NULL 
+            WHERE incident_id = $1;
+            """,
+            incident_id
+        )
+
+        return {"status": "SUCCESS", "incident_id": incident_id, "state": "IN_PROGRESS"}
