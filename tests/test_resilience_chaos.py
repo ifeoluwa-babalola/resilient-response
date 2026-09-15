@@ -4,6 +4,7 @@ import os
 import time
 import asyncpg
 import redis.asyncio as redis
+from apps.worker.notifier import MockSMSProvider, process_pending_notifications
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres_password@localhost:5432/emergency_db")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -331,3 +332,80 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+async def test_sms_failure_isolation():
+    print("\n--- [Test 4] Notification Failure Isolation & Retries ---")
+    conn = await asyncpg.connect(DATABASE_URL)
+
+    inc_id = "IR-NOTIF-TEST-01"
+    resp_id = "RESP-1"
+
+    # 1. Setup Incident and Assignment state
+    await conn.execute("DELETE FROM notifications WHERE incident_id = $1;", inc_id)
+    await conn.execute("DELETE FROM assignments WHERE incident_id = $1;", inc_id)
+    await conn.execute("DELETE FROM incidents WHERE incident_id = $1;", inc_id)
+
+    await conn.execute(
+        """
+        INSERT INTO incidents (incident_id, organization_id, submission_id, channel, category, urgency, status, location_text)
+        VALUES ($1, '00000000-0000-0000-0000-000000000001', 'SUB-NOTIF', 'USSD', 'FIRE', 'HIGH', 'ASSIGNED', 'Notif Area');
+        """,
+        inc_id,
+    )
+
+    await conn.execute(
+        "INSERT INTO assignments (incident_id, responder_id, status) VALUES ($1, $2, 'ASSIGNED');",
+        inc_id,
+        resp_id,
+    )
+
+    # 2. Queue notification record (simulating assignment trigger)
+    notif_id = await conn.fetchval(
+        """
+        INSERT INTO notifications (incident_id, responder_id, recipient_phone, message_body, status, max_retries)
+        VALUES ($1, $2, '+254700000000', 'Emergency dispatch assignment: IR-NOTIF-TEST-01', 'PENDING', 3)
+        RETURNING notification_id;
+        """,
+        inc_id,
+        resp_id,
+    )
+
+    # 3. Simulate SMS failure (100% failure rate)
+    failing_provider = MockSMSProvider(failure_rate=1.0)
+    await process_pending_notifications(conn, failing_provider)
+
+    # 4. Assert: SMS failed, but Assignment & Incident state remained valid
+    assign_status = await conn.fetchval(
+        "SELECT status FROM assignments WHERE incident_id = $1;", inc_id
+    )
+    inc_status = await conn.fetchval(
+        "SELECT status FROM incidents WHERE incident_id = $1;", inc_id
+    )
+    notif_status = await conn.fetchval(
+        "SELECT status FROM notifications WHERE notification_id = $1;", notif_id
+    )
+    retry_count = await conn.fetchval(
+        "SELECT retry_count FROM notifications WHERE notification_id = $1;", notif_id
+    )
+
+    assert assign_status == "ASSIGNED", "FAILED: Assignment was altered by notification failure!"
+    assert inc_status == "ASSIGNED", "FAILED: Incident status was rolled back!"
+    assert notif_status == "FAILED", "FAILED: Notification status did not record failure!"
+    assert retry_count == 1, "FAILED: Retry count did not increment!"
+
+    print("✅ PASSED: SMS failure did not affect assignment state. Retry recorded.")
+
+    # 5. Retry with working provider (0% failure rate)
+    working_provider = MockSMSProvider(failure_rate=0.0)
+    await process_pending_notifications(conn, working_provider)
+
+    final_notif_status = await conn.fetchval(
+        "SELECT status FROM notifications WHERE notification_id = $1;", notif_id
+    )
+    assert final_notif_status == "SENT", "FAILED: Notification did not succeed on retry!"
+
+    print("✅ PASSED: Notification successfully retried and delivered.")
+    await conn.close()
+
+if __name__ == "__main__":
+    asyncio.run(test_sms_failure_isolation())

@@ -3,15 +3,30 @@ import os
 import uuid
 from typing import Optional
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, status
+from apps.db import init_db, close_db
+from apps.routes import incidents
 from pydantic import BaseModel, Field
 import redis.asyncio as redis
+
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 STREAM_NAME = "incidents:ingest"
 
-app = FastAPI(title="Resilient Response API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    yield
+    await close_db()
 
+app = FastAPI(title="Resilient Response API", lifespan=lifespan)
+
+app.include_router(incidents.router)
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
 
 @app.on_event("startup")
 async def startup():

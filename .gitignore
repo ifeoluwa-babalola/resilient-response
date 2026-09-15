@@ -1,19 +1,26 @@
-# Python temporary files & cache
-__pycache__/
-*.py[cod]
-*$py.class
-.pytest_cache/
+# Virtual environment
 .venv/
-venv/
-ENV/
 
-# Environment files with passwords/secrets
+# Environment variables
 .env
 
-# Database data folders (local development)
-.postgres_data/
-.redis_data/
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 
-# OS junk files
+# IDE files
+.vscode/
+.idea/
+
+# OS files
 .DS_Store
 Thumbs.db
+
+# Test and coverage
+.pytest_cache/
+.coverage
+
+# Logs
+*.log

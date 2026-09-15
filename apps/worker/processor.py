@@ -90,5 +90,35 @@ async def run_worker():
         await db_pool.close()
         await redis_client.close()
 
+async def drain_pg_outbox(db_pool: asyncpg.Pool):
+    """Recovers events written to PostgreSQL during Redis outage."""
+    async with db_pool.acquire() as conn:
+        records = await conn.fetch(
+            """
+            SELECT event_id, payload 
+            FROM ingestion_events 
+            WHERE status = 'PENDING' 
+            ORDER BY created_at ASC 
+            LIMIT 50 
+            FOR UPDATE SKIP LOCKED;
+            """
+        )
+
+        for rec in records:
+            event_id = rec["event_id"]
+            payload = json.loads(rec["payload"])
+
+            # Uses the exact same idempotent processing logic
+            await process_event(db_pool, payload)
+
+            await conn.execute(
+                """
+                UPDATE ingestion_events 
+                SET status = 'REPROCESSED', processed_at = NOW() 
+                WHERE event_id = $1;
+                """,
+                event_id,
+            )
+
 if __name__ == "__main__":
     asyncio.run(run_worker())
