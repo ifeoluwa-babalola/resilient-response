@@ -1,0 +1,73 @@
+name: Resilience & Reliability CI
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgis/postgis:15-3.3
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres_password
+          POSTGRES_DB: emergency_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-asyncio asyncpg redis httpx pytest-cov fastapi uvicorn
+
+      - name: Apply Database Migrations
+        env:
+          PGPASSWORD: postgres_password
+        run: |
+          for file in migrations/*.sql; do
+            echo "Applying $file..."
+            psql -h localhost -U postgres -d emergency_db -f "$file"
+          done
+
+      - name: Execute Reliability Test Suite
+        env:
+          DATABASE_URL: postgresql://postgres:postgres_password@localhost:5432/emergency_db
+          REDIS_URL: redis://localhost:6379/0
+        run: |
+          pytest tests/test_reliability_suite.py --cov=apps --cov-report=xml -v
+
+      - name: Upload Coverage Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
