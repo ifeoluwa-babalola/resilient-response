@@ -1,79 +1,191 @@
 import asyncio
 import os
+
+from datetime import datetime, timezone, timedelta
+
 import asyncpg
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres_password@localhost:5432/emergency_db")
 
-async def route_incident(conn: asyncpg.Connection, incident_id: str, lng: float, lat: float, radius_meters: float = 10000.0):
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://postgres:postgres_password@localhost:5432/emergency_db",
+)
+
+ACK_TIMEOUT_SECONDS = 15
+
+
+async def route_incident(
+    conn: asyncpg.Connection,
+    incident_id: str,
+    lng: float,
+    lat: float,
+    radius_meters: float = 10000.0,
+):
     """
-    Finds the best eligible responder using 5 deterministic checks and assigns the incident.
+    Finds the best eligible responder and starts
+    the assignment + ACK timeout lifecycle.
     """
-    # 5-Step Routing Query
+
     find_responder_query = """
-        SELECT 
+        SELECT
             responder_id,
             name,
             current_active_incidents,
-            ST_Distance(location, ST_SetSRID(ST_MakePoint($1, $2), 4326)) AS distance_meters
+            ST_Distance(
+                location,
+                ST_SetSRID(ST_MakePoint($1, $2), 4326)
+            ) AS distance_meters
         FROM responders
-        WHERE is_eligible = TRUE                                           -- 1. Eligible?
-          AND is_online = TRUE                                             -- 2. Online?
-          AND ST_DWithin(location, ST_SetSRID(ST_MakePoint($1, $2), 4326), $3) -- 3. Within Radius?
-          AND current_active_incidents < active_capacity                  -- 4. Capacity Available?
-        ORDER BY 
-            current_active_incidents ASC,                                  -- 5. Lowest Workload First
-            distance_meters ASC                                            -- Tie-breaker: Closest distance
+        WHERE is_eligible = TRUE
+          AND is_online = TRUE
+          AND ST_DWithin(
+                location,
+                ST_SetSRID(ST_MakePoint($1, $2), 4326),
+                $3
+          )
+          AND current_active_incidents < active_capacity
+        ORDER BY
+            current_active_incidents ASC,
+            distance_meters ASC
         LIMIT 1
-        FOR UPDATE; -- Lock row to prevent race conditions
+        FOR UPDATE;
     """
 
     async with conn.transaction():
-        best_responder = await conn.fetchrow(find_responder_query, lng, lat, radius_meters)
 
+        #
+        # Lock incident first.
+        # ACK and Escalator lock incidents first too.
+        # Consistent lock ordering prevents deadlocks.
+        #
+        incident = await conn.fetchrow(
+            """
+            SELECT incident_id
+            FROM incidents
+            WHERE incident_id = $1
+            FOR UPDATE;
+            """,
+            incident_id,
+        )
+
+        if not incident:
+            raise ValueError(
+                f"Incident not found: {incident_id}"
+            )
+
+        best_responder = await conn.fetchrow(
+            find_responder_query,
+            lng,
+            lat,
+            radius_meters,
+        )
+
+        #
+        # No responder available
+        #
         if not best_responder:
-            print(f"⚠️ No available responder found for incident {incident_id}")
+
+            await conn.execute(
+                """
+                UPDATE incidents
+                SET
+                    status = 'ESCALATED_TO_SUPERVISOR',
+                    ack_deadline = NULL
+                WHERE incident_id = $1;
+                """,
+                incident_id,
+            )
+
+            print(
+                f"⚠️ No available responder found "
+                f"for incident {incident_id}. "
+                f"Escalated to SUPERVISOR."
+            )
+
             return None
 
         responder_id = best_responder["responder_id"]
 
-        # 1. Create assignment record
-        await conn.execute(
-            """
-            INSERT INTO assignments (incident_id, responder_id, status)
-            VALUES ($1, $2, 'ASSIGNED')
-            """,
-            incident_id, responder_id
+        deadline = (
+            datetime.now(timezone.utc)
+            + timedelta(seconds=ACK_TIMEOUT_SECONDS)
         )
 
-        # 2. Increment responder workload
+        #
+        # Create assignment
+        #
         await conn.execute(
             """
-            UPDATE responders 
-            SET current_active_incidents = current_active_incidents + 1 
-            WHERE responder_id = $1
+            INSERT INTO assignments (
+                incident_id,
+                responder_id,
+                status
+            )
+            VALUES (
+                $1,
+                $2,
+                'ASSIGNED'
+            );
             """,
-            responder_id
+            incident_id,
+            responder_id,
         )
 
-        # 3. Update incident status
+        #
+        # Increment responder workload
+        #
         await conn.execute(
             """
-            UPDATE incidents 
-            SET status = 'ASSIGNED' 
-            WHERE incident_id = $1
+            UPDATE responders
+            SET current_active_incidents =
+                current_active_incidents + 1
+            WHERE responder_id = $1;
             """,
-            incident_id
+            responder_id,
         )
 
-        print(f"✅ Incident {incident_id} assigned to {best_responder['name']} ({responder_id})")
+        #
+        # Start ACK lifecycle
+        #
+        await conn.execute(
+            """
+            UPDATE incidents
+            SET
+                status = 'ASSIGNED',
+                assignment_count = 1,
+                ack_deadline = $2
+            WHERE incident_id = $1;
+            """,
+            incident_id,
+            deadline,
+        )
+
+        print(
+            f"✅ Incident {incident_id} assigned to "
+            f"{best_responder['name']} ({responder_id})"
+        )
+
         return responder_id
 
+
 async def main():
-    pool = await asyncpg.create_pool(dsn=DATABASE_URL)
-    async with pool.acquire() as conn:
-        # Simulate routing an incident near Central Market (-0.12, 51.50)
-        await route_incident(conn, "IR-SUB-001", lng=-0.12, lat=51.50)
-    await pool.close()
+    pool = await asyncpg.create_pool(
+        dsn=DATABASE_URL
+    )
+
+    try:
+        async with pool.acquire() as conn:
+
+            await route_incident(
+                conn,
+                "IR-SUB-001",
+                lng=-0.12,
+                lat=51.50,
+            )
+
+    finally:
+        await pool.close()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio

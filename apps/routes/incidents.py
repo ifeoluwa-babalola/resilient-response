@@ -82,3 +82,46 @@ async def ingest_incident(payload: IncidentIngestionRequest, req_app=None):
         submission_id=payload.submission_id,
         incident_id=incident_id,
     )
+
+@router.get("/{submission_id}")
+async def get_incident_status(submission_id: str):
+    db_url = os.getenv(
+        "DATABASE_URL",
+        "postgresql://postgres:postgres_password@localhost:5432/emergency_db",
+    )
+    conn = await asyncpg.connect(db_url)
+    try:
+        # Check domain incidents table first
+        row = await conn.fetchrow(
+            """
+            SELECT incident_id, submission_id, status, category, location_text, created_at
+            FROM incidents
+            WHERE submission_id = $1;
+            """,
+            submission_id,
+        )
+
+        if row:
+            return dict(row)
+
+        # Fallback check on pending outbox events if not in domain table yet
+        outbox_row = await conn.fetchrow(
+            """
+            SELECT submission_id, status, created_at 
+            FROM ingestion_events 
+            WHERE submission_id = $1 AND status = 'PENDING';
+            """,
+            submission_id,
+        )
+
+        if outbox_row:
+            return {
+                "submission_id": submission_id,
+                "incident_id": f"IR-{submission_id.upper()}",
+                "status": "QUEUED_DURABLE",
+                "location_text": "Ingested via Fallback Buffer",
+            }
+
+        raise HTTPException(status_code=404, detail="Incident submission not found")
+    finally:
+        await conn.close()

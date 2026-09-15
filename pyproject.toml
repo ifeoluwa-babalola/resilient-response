@@ -9,7 +9,8 @@ dependencies = [
     "uvicorn",
     "asyncpg",
     "redis",
-    "pydantic"
+    "pydantic",
+    "httpx"
 ]
 
 [build-system]
